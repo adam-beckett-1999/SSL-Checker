@@ -5,16 +5,29 @@ import time
 from collections import deque
 from typing import List, Optional, Tuple, Dict
 
-from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
+import logging
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, Response
+from contextlib import asynccontextmanager
 import json
 
 # Import the existing checker
 from ssl_checker import SSLChecker
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Basic startup diagnostics (does not log secrets)
+    logger.info(
+        "API starting. key_required=%s, rate_per_min=%s, max_hosts=%s, allowed_ports=%s",
+        bool(REQUIRE_API_KEY), RATE_LIMIT_PER_MIN, MAX_HOSTS, sorted(ALLOWED_PORTS),
+    )
+    yield
+
+
 app = FastAPI(
     title="SSL Checker API",
     version="1.0.0",
     description="Self-hosted API wrapper around the Python SSL/TLS checker",
+    lifespan=lifespan,
 )
 
 # Config (environment-overridable)
@@ -58,6 +71,27 @@ def rate_limit(request: Request):
     if len(bucket) >= RATE_LIMIT_PER_MIN:
         raise HTTPException(status_code=429, detail="Too Many Requests")
     bucket.append(now)
+
+
+logger = logging.getLogger("ssl-checker-api")
+
+
+@app.middleware("http")
+async def _enforce_security(request: Request, call_next):
+    # Enforce on API paths; allow healthz and docs without auth
+    path = request.url.path
+    if path.startswith("/api/") and not path.startswith("/api/docs"):
+        # Rate limit early
+        try:
+            rate_limit(request)
+        except HTTPException as e:
+            return Response(status_code=e.status_code, content=json.dumps({"detail": e.detail}), media_type="application/json")
+
+        if REQUIRE_API_KEY:
+            hdr = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+            if not hdr or hdr != REQUIRE_API_KEY:
+                return Response(status_code=403, content=json.dumps({"detail": "Forbidden: invalid API key"}), media_type="application/json")
+    return await call_next(request)
 
 
 def _parse_host_port(raw: str) -> Tuple[str, int]:
