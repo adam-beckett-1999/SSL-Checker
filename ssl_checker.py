@@ -31,8 +31,13 @@ class SSLChecker:
     total_failed = 0
     total_warning = 0
 
-    def get_cert(self, host, port, socks_host=None, socks_port=None):
-        """Connect to the host and negotiate TLS, preferring the highest version (TLS 1.3 if available)."""
+    def get_cert(self, host, port, socks_host=None, socks_port=None, timeout=10, retries=1):
+        """Connect to the host and negotiate TLS, preferring the highest version (TLS 1.3 if available).
+
+        Parameters:
+        - timeout: socket timeout in seconds for connect/handshake.
+        - retries: number of additional attempts on failure (>=0).
+        """
         use_socks = False
         socks_module = None
         if socks_host:
@@ -52,48 +57,56 @@ class SSLChecker:
             method_candidates.append(('auto', SSL.SSLv23_METHOD))
 
         last_error = None
-        for label, tls_method in method_candidates:
-            sock = None
-            try:
-                if use_socks and socks_module is not None:
-                    sock = socks_module.socksocket(socket.AF_INET, socket.SOCK_STREAM)
-                    sp = 1080 if socks_port is None else int(socks_port)
-                    socks_module.setdefaultproxy(socks_module.PROXY_TYPE_SOCKS5, socks_host, sp, True)
-                else:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
-                sock.connect((host, int(port)))
-                sock.settimeout(None)
+        attempts = max(0, int(retries)) + 1
+        for attempt in range(attempts):
+            for label, tls_method in method_candidates:
+                sock = None
+                try:
+                    if use_socks and socks_module is not None:
+                        sock = socks_module.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+                        sp = 1080 if socks_port is None else int(socks_port)
+                        socks_module.setdefaultproxy(socks_module.PROXY_TYPE_SOCKS5, socks_host, sp, True)
+                    else:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(timeout)
+                    sock.connect((host, int(port)))
+                    # Use blocking mode for the SSL handshake to avoid premature timeouts
+                    sock.settimeout(None)
 
-                ctx = SSL.Context(tls_method)
-                con = SSL.Connection(ctx, sock)
-                con.set_tlsext_host_name(host.encode())
-                con.set_connect_state()
-                con.do_handshake()
+                    ctx = SSL.Context(tls_method)
+                    con = SSL.Connection(ctx, sock)
+                    con.set_tlsext_host_name(host.encode())
+                    con.set_connect_state()
+                    con.do_handshake()
 
-                cert = con.get_peer_certificate()
-                resolved_ip = socket.gethostbyname(host)
-
-                # Determine the negotiated protocol version if available
-                tls_version = label
-                if hasattr(con, 'get_protocol_version_name'):
+                    cert = con.get_peer_certificate()
                     try:
-                        negotiated = con.get_protocol_version_name()
-                        # Normalize OpenSSL name to our display format
-                        if negotiated and isinstance(negotiated, str):
-                            tls_version = negotiated.replace('TLSv', 'TLS ')
+                        resolved_ip = socket.gethostbyname(host)
+                    except Exception:
+                        resolved_ip = ''
+
+                    # Determine the negotiated protocol version if available
+                    tls_version = label
+                    if hasattr(con, 'get_protocol_version_name'):
+                        try:
+                            negotiated = con.get_protocol_version_name()
+                            if negotiated and isinstance(negotiated, str):
+                                tls_version = negotiated.replace('TLSv', 'TLS ')
+                        except Exception:
+                            pass
+                    return cert, resolved_ip, tls_version
+                except Exception as e:
+                    last_error = e
+                    continue
+                finally:
+                    try:
+                        if sock:
+                            sock.close()
                     except Exception:
                         pass
-                return cert, resolved_ip, tls_version
-            except Exception as e:
-                last_error = e
-                continue
-            finally:
-                try:
-                    if sock:
-                        sock.close()
-                except Exception:
-                    pass
+            # Backoff before next attempt (short to keep CI fast)
+            if attempt < attempts - 1:
+                sleep(1)
 
         # If all attempts fail, raise the last captured error
         if last_error:
@@ -328,9 +341,9 @@ class SSLChecker:
                         socks_host, socks_port = str(user_args.socks).split(':', 1)
                     else:
                         socks_host, socks_port = str(user_args.socks), 1080
-                    cert, resolved_ip, tls_version = self.get_cert(host, port, socks_host, socks_port)
+                    cert, resolved_ip, tls_version = self.get_cert(host, port, socks_host, socks_port, timeout=getattr(user_args, 'timeout', 10), retries=getattr(user_args, 'retries', 1))
                 else:
-                    cert, resolved_ip, tls_version = self.get_cert(host, port)
+                    cert, resolved_ip, tls_version = self.get_cert(host, port, timeout=getattr(user_args, 'timeout', 10), retries=getattr(user_args, 'retries', 1))
 
                 context[host] = self.get_cert_info(host, cert, resolved_ip, tls_version)
                 context[host]['tcp_port'] = int(port)
