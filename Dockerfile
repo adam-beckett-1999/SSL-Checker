@@ -16,5 +16,11 @@ COPY . /app
 
 EXPOSE 8000
 
+# Security/configuration defaults (override at runtime with -e)
+ENV SSL_CHECKER_MAX_HOSTS=5 \
+    SSL_CHECKER_ALLOWED_PORTS=443 \
+    SSL_CHECKER_RATE_PER_MIN=60 \
+    SSL_CHECKER_API_KEY=
+
 # Default to run the API server; can override to run the CLI
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

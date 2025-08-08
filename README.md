@@ -70,6 +70,26 @@ Notes:
 - TLS: Auto‑negotiates the highest protocol supported by the server and OpenSSL (TLS 1.3 when available).
 - Analyze: When `analyze=true`, results come from SSL Labs (cached where possible, short timeouts). If not READY, the response may include `analyze_status`/`analyze_error` instead of a grade.
 
+## Configuration (env vars)
+
+You can tune basic safety limits using environment variables (all have sensible defaults):
+
+- SSL_CHECKER_MAX_HOSTS (default 5): Max number of hosts per request.
+- SSL_CHECKER_ALLOWED_PORTS (default 443): Comma‑separated list of allowed ports, e.g. `443,8443`.
+- SSL_CHECKER_RATE_PER_MIN (default 60): Per‑IP requests per minute.
+- SSL_CHECKER_API_KEY (empty by default): If set, requests must include header `X-API-Key` with this value.
+
+Example:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e SSL_CHECKER_MAX_HOSTS=2 \
+  -e SSL_CHECKER_ALLOWED_PORTS=443 \
+  -e SSL_CHECKER_RATE_PER_MIN=30 \
+  -e SSL_CHECKER_API_KEY=changeme \
+  sentinelkasai/ssl-checker:dev
+```
+
 ## Use the CLI (inside Docker)
 
 The image includes the original script. Override the container command to run the CLI instead of the API:
