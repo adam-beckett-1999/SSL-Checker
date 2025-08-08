@@ -11,11 +11,11 @@ Highlights:
 
 ## Quick start (Docker)
 
-Build and run the API locally:
+Use the published image:
 
 ```bash
-docker build -t ssl-checker-api .
-docker run --rm -p 8000:8000 ssl-checker-api
+docker pull sentinelkasai/ssl-checker:dev
+docker run --rm -p 8000:8000 sentinelkasai/ssl-checker:dev
 ```
 
 Verify it’s up:
@@ -67,28 +67,50 @@ Base URL: `/`
 
 Notes:
 
-- TLS: The checker negotiates the highest available version (TLS 1.3 when supported), with fallback to TLS 1.2/1.1/1.0.
-- Deep analysis depends on `https://api.ssllabs.com/`; ensure egress is allowed.
+- TLS: Auto‑negotiates the highest protocol supported by the server and OpenSSL (TLS 1.3 when available).
+- Analyze: When `analyze=true`, results come from SSL Labs (cached where possible, short timeouts). If not READY, the response may include `analyze_status`/`analyze_error` instead of a grade.
+
+## Configuration (env vars)
+
+You can tune basic safety limits using environment variables (all have sensible defaults):
+
+- SSL_CHECKER_MAX_HOSTS (default 5): Max number of hosts per request.
+- SSL_CHECKER_ALLOWED_PORTS (default 443): Comma‑separated list of allowed ports, e.g. `443,8443`.
+- SSL_CHECKER_RATE_PER_MIN (default 60): Per‑IP requests per minute.
+- SSL_CHECKER_API_KEY (set at runtime only): If set, requests must include header `X-API-Key` with this value.
+
+Example:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e SSL_CHECKER_MAX_HOSTS=2 \
+  -e SSL_CHECKER_ALLOWED_PORTS=443 \
+  -e SSL_CHECKER_RATE_PER_MIN=30 \
+  -e SSL_CHECKER_API_KEY=changeme \
+  sentinelkasai/ssl-checker:dev
+```
+
+Tip: The image includes a HEALTHCHECK that calls `/healthz`. In CI, consider waiting for `docker inspect -f '{{json .State.Health.Status}}'` to be `healthy` before curl tests.
 
 ## Use the CLI (inside Docker)
 
 The image includes the original script. Override the container command to run the CLI instead of the API:
 
 ```bash
-docker run --rm ssl-checker-api python ssl_checker.py -H example.com -j
+docker run --rm sentinelkasai/ssl-checker:dev python ssl_checker.py -H example.com -j
 ```
 
 More CLI examples:
 
 ```bash
 # Multiple hosts
-docker run --rm ssl-checker-api python ssl_checker.py -H example.com github.com:443
+docker run --rm sentinelkasai/ssl-checker:dev python ssl_checker.py -H example.com github.com:443
 
 # Summary only
-docker run --rm ssl-checker-api python ssl_checker.py -H example.com -S
+docker run --rm sentinelkasai/ssl-checker:dev python ssl_checker.py -H example.com -S
 
 # Save JSON per host
-docker run --rm -v "$PWD:/out" -w /out ssl-checker-api python /app/ssl_checker.py -H example.com -J
+docker run --rm -v "$PWD:/out" -w /out sentinelkasai/ssl-checker:dev python /app/ssl_checker.py -H example.com -J
 ```
 
 Tip: Mount a volume (`-v $PWD:/out -w /out`) when you want files (CSV/JSON/HTML) written back to the host.

@@ -1,0 +1,18 @@
+version: "3.8"
+services:
+  ssl-checker:
+    # Use the published image, or switch to `build: .` for local dev builds
+    image: sentinelkasai/ssl-checker:dev
+    # build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Safety limits (override as needed)
+      SSL_CHECKER_MAX_HOSTS: "5"
+      SSL_CHECKER_ALLOWED_PORTS: "443"
+      SSL_CHECKER_RATE_PER_MIN: "60"
+      # Uncomment to require an API key for /api/* endpoints
+      # SSL_CHECKER_API_KEY: "changeme"
+    restart: unless-stopped
+    # The image contains a HEALTHCHECK for /healthz
+    # healthcheck is honored automatically by Docker/Compose

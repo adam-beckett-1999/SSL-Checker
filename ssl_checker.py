@@ -10,7 +10,6 @@ from csv import DictWriter
 
 try:
     from OpenSSL import SSL
-    from json2html import *
 except ImportError:
     print('Please install required modules: pip install -r requirements.txt')
     sys.exit(1)
@@ -32,70 +31,82 @@ class SSLChecker:
     total_failed = 0
     total_warning = 0
 
-    def get_cert(self, host, port, socks_host=None, socks_port=None):
-        """Connect to the host and negotiate TLS, preferring the highest version (TLS 1.3 if available)."""
+    def get_cert(self, host, port, socks_host=None, socks_port=None, timeout=10, retries=1):
+        """Connect to the host and negotiate TLS, preferring the highest version (TLS 1.3 if available).
+
+        Parameters:
+        - timeout: socket timeout in seconds for connect/handshake.
+        - retries: number of additional attempts on failure (>=0).
+        """
+        use_socks = False
+        socks_module = None
         if socks_host:
-            import socks
-            socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, socks_host, int(socks_port), True) # pyright: ignore[reportArgumentType]
-            socket.socket = socks.socksocket
+            import socks as _socks
+            socks_module = _socks
+            use_socks = True
 
         # Prefer a generic TLS client method (negotiates the highest version, including TLS 1.3),
-        # with fallbacks to specific methods for older OpenSSL/servers.
+        # with a single legacy alias fallback for older OpenSSL.
         method_candidates = []
         if hasattr(SSL, 'TLS_CLIENT_METHOD'):
-            method_candidates.append(('auto', getattr(SSL, 'TLS_CLIENT_METHOD')))
+            method_candidates.append(('auto', SSL.TLS_CLIENT_METHOD))
         elif hasattr(SSL, 'TLS_METHOD'):
-            method_candidates.append(('auto', getattr(SSL, 'TLS_METHOD')))
+            method_candidates.append(('auto', SSL.TLS_METHOD))
         elif hasattr(SSL, 'SSLv23_METHOD'):
-            # Historical name that negotiates the highest available protocol
-            method_candidates.append(('auto', getattr(SSL, 'SSLv23_METHOD')))
-
-        # Keep legacy explicit fallbacks (lowest chance to be needed)
-        if hasattr(SSL, 'TLSv1_2_METHOD'):
-            method_candidates.append(('TLS 1.2', getattr(SSL, 'TLSv1_2_METHOD')))
-        if hasattr(SSL, 'TLSv1_1_METHOD'):
-            method_candidates.append(('TLS 1.1', getattr(SSL, 'TLSv1_1_METHOD')))
-        if hasattr(SSL, 'TLSv1_METHOD'):
-            method_candidates.append(('TLS 1.0', getattr(SSL, 'TLSv1_METHOD')))
+            # Historical alias that negotiates the highest available protocol
+            method_candidates.append(('auto', SSL.SSLv23_METHOD))
 
         last_error = None
-        for label, tls_method in method_candidates:
-            sock = None
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
-                sock.connect((host, int(port)))
-                sock.settimeout(None)
+        attempts = max(0, int(retries)) + 1
+        for attempt in range(attempts):
+            for label, tls_method in method_candidates:
+                sock = None
+                try:
+                    if use_socks and socks_module is not None:
+                        sock = socks_module.socksocket(socket.AF_INET, socket.SOCK_STREAM)
+                        sp = 1080 if socks_port is None else int(socks_port)
+                        socks_module.setdefaultproxy(socks_module.PROXY_TYPE_SOCKS5, socks_host, sp, True)
+                    else:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(timeout)
+                    sock.connect((host, int(port)))
+                    # Use blocking mode for the SSL handshake to avoid premature timeouts
+                    sock.settimeout(None)
 
-                ctx = SSL.Context(tls_method)
-                con = SSL.Connection(ctx, sock)
-                con.set_tlsext_host_name(host.encode())
-                con.set_connect_state()
-                con.do_handshake()
+                    ctx = SSL.Context(tls_method)
+                    con = SSL.Connection(ctx, sock)
+                    con.set_tlsext_host_name(host.encode())
+                    con.set_connect_state()
+                    con.do_handshake()
 
-                cert = con.get_peer_certificate()
-                resolved_ip = socket.gethostbyname(host)
-
-                # Determine the negotiated protocol version if available
-                tls_version = label
-                if hasattr(con, 'get_protocol_version_name'):
+                    cert = con.get_peer_certificate()
                     try:
-                        negotiated = con.get_protocol_version_name()
-                        # Normalize OpenSSL name to our display format
-                        if negotiated and isinstance(negotiated, str):
-                            tls_version = negotiated.replace('TLSv', 'TLS ')
+                        resolved_ip = socket.gethostbyname(host)
+                    except Exception:
+                        resolved_ip = ''
+
+                    # Determine the negotiated protocol version if available
+                    tls_version = label
+                    if hasattr(con, 'get_protocol_version_name'):
+                        try:
+                            negotiated = con.get_protocol_version_name()
+                            if negotiated and isinstance(negotiated, str):
+                                tls_version = negotiated.replace('TLSv', 'TLS ')
+                        except Exception:
+                            pass
+                    return cert, resolved_ip, tls_version
+                except Exception as e:
+                    last_error = e
+                    continue
+                finally:
+                    try:
+                        if sock:
+                            sock.close()
                     except Exception:
                         pass
-                return cert, resolved_ip, tls_version
-            except Exception as e:
-                last_error = e
-                continue
-            finally:
-                try:
-                    if sock:
-                        sock.close()
-                except Exception:
-                    pass
+            # Backoff before next attempt (short to keep CI fast)
+            if attempt < attempts - 1:
+                sleep(1)
 
         # If all attempts fail, raise the last captured error
         if last_error:
@@ -110,64 +121,103 @@ class SSLChecker:
         print(result)
 
     def analyze_ssl(self, host, context, user_args):
-        """Analyze the security of the SSL certificate."""
-        try:
-            from urllib.request import urlopen
-        except ImportError:
-            from urllib2 import urlopen
+        """Analyze the security of the SSL certificate using SSL Labs.
+
+        Fast-path behavior: prefer cached results and avoid long waits/timeouts in CI.
+        If cached results are not READY, annotate and return without blocking.
+        """
+        from urllib.request import urlopen
+        from urllib.error import URLError, HTTPError
 
         api_url = 'https://api.ssllabs.com/api/v3/'
-        while True:
-            if user_args.verbose:
-                print('{}Requesting analyze to {}{}\n'.format(Clr.YELLOW, api_url, Clr.RST))
-
-            main_request = json.loads(urlopen(api_url + 'analyze?host={}'.format(host)).read().decode('utf-8'))
-            if main_request['status'] in ('DNS', 'IN_PROGRESS'):
-                if user_args.verbose:
-                    print('{}Analyze waiting for reports to be finished (5 secs){}\n'.format(Clr.YELLOW, Clr.RST))
-
-                sleep(5)
-                continue
-            elif main_request['status'] == 'READY':
-                if user_args.verbose:
-                    print('{}Analyze is ready{}\n'.format(Clr.YELLOW, Clr.RST))
-
-                break
-
-        endpoint_data = json.loads(urlopen(api_url + 'getEndpointData?host={}&s={}'.format(
-            host, main_request['endpoints'][0]['ipAddress'])).read().decode('utf-8'))
+        analyze_url = f"{api_url}analyze?host={host}&fromCache=on&all=done&startNew=off"
 
         if user_args.verbose:
-            print('{}Analyze report message: {}{}\n'.format(Clr.YELLOW, endpoint_data['statusMessage'], Clr.RST))
+            print('{}Requesting analyze (cached) from {}{}\n'.format(Clr.YELLOW, api_url, Clr.RST))
 
-        # if the certificate is invalid
-        if endpoint_data['statusMessage'] == 'Certificate not valid for domain name':
+        try:
+            main_request = json.loads(urlopen(analyze_url, timeout=10).read().decode('utf-8'))
+        except (URLError, HTTPError, TimeoutError) as e:
+            # Do not fail the overall run; annotate and return
+            context.setdefault(host, {})
+            context[host]['analyze_error'] = f'SSL Labs request failed: {e}'
             return context
 
-        context[host]['grade'] = main_request['endpoints'][0]['grade']
-        context[host]['poodle_vuln'] = endpoint_data['details']['poodle']
-        context[host]['heartbleed_vuln'] = endpoint_data['details']['heartbleed']
-        context[host]['heartbeat_vuln'] = endpoint_data['details']['heartbeat']
-        context[host]['freak_vuln'] = endpoint_data['details']['freak']
-        context[host]['logjam_vuln'] = endpoint_data['details']['logjam']
-        context[host]['drownVulnerable'] = endpoint_data['details']['drownVulnerable']
+        status = main_request.get('status')
+        if status != 'READY':
+            # Avoid long waits; annotate status and return
+            context.setdefault(host, {})
+            context[host]['analyze_status'] = status or 'UNKNOWN'
+            return context
+
+        # With READY status, proceed to fetch endpoint details
+        try:
+            ip_addr = main_request['endpoints'][0]['ipAddress']
+            endpoint_url = f"{api_url}getEndpointData?host={host}&s={ip_addr}"
+            endpoint_data = json.loads(urlopen(endpoint_url, timeout=10).read().decode('utf-8'))
+        except Exception as e:
+            context.setdefault(host, {})
+            context[host]['analyze_error'] = f'Endpoint fetch failed: {e}'
+            return context
+
+        if user_args.verbose:
+            print('{}Analyze report message: {}{}\n'.format(Clr.YELLOW, endpoint_data.get('statusMessage', 'n/a'), Clr.RST))
+
+        # if the certificate is invalid
+        if endpoint_data.get('statusMessage') == 'Certificate not valid for domain name':
+            return context
+
+        # Populate known fields when present
+        try:
+            context[host]['grade'] = main_request['endpoints'][0].get('grade')
+            details = endpoint_data.get('details', {})
+            context[host]['poodle_vuln'] = details.get('poodle')
+            context[host]['heartbleed_vuln'] = details.get('heartbleed')
+            context[host]['heartbeat_vuln'] = details.get('heartbeat')
+            context[host]['freak_vuln'] = details.get('freak')
+            context[host]['logjam_vuln'] = details.get('logjam')
+            context[host]['drownVulnerable'] = details.get('drownVulnerable')
+        except Exception:
+            # Keep resilient even if schema shifts
+            pass
 
         return context
 
     def get_cert_sans(self, x509cert):
+        """Get Subject Alt Names without using deprecated pyOpenSSL X.509 extension APIs.
+
+        Returns a semicolon-separated string like "DNS:example.com; DNS:*.example.com; IP:1.2.3.4"
+        to preserve backward compatibility with existing outputs.
         """
-        Get Subject Alt Names from Certificate. Shameless taken from stack overflow:
-        https://stackoverflow.com/users/4547691/anatolii-chmykhalo
-        """
-        san = ''
-        ext_count = x509cert.get_extension_count()
-        for i in range(0, ext_count):
-            ext = x509cert.get_extension(i)
-            if 'subjectAltName' in str(ext.get_short_name()):
-                san = ext.__str__()
-        # replace commas to not break csv output
-        san = san.replace(',', ';')
-        return san
+        try:
+            from cryptography import x509 as cx509
+            from cryptography.x509.oid import ExtensionOID
+        except Exception:
+            # Fallback to original behavior if cryptography import fails (unlikely since pyOpenSSL depends on it)
+            try:
+                san = ''
+                ext_count = x509cert.get_extension_count()
+                for i in range(0, ext_count):
+                    ext = x509cert.get_extension(i)
+                    if 'subjectAltName' in str(ext.get_short_name()):
+                        san = ext.__str__()
+                return san.replace(',', ';')
+            except Exception:
+                return ''
+
+        try:
+            crypto_cert = x509cert.to_cryptography()
+            san_ext = crypto_cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+            dns_names = san_ext.get_values_for_type(cx509.DNSName)
+            ip_addrs = san_ext.get_values_for_type(cx509.IPAddress)
+            parts = []
+            for d in dns_names:
+                parts.append(f'DNS:{d}')
+            for ip in ip_addrs:
+                parts.append(f'IP:{ip}')
+            return '; '.join(parts)
+        except Exception:
+            return ''
 
     def get_cert_info(self, host, cert, resolved_ip, tls_version=None):
         """Get all the information about cert and create a JSON file."""
@@ -286,10 +336,14 @@ class SSLChecker:
                     if user_args.verbose:
                         print('{}Socks proxy enabled, connecting via proxy{}\n'.format(Clr.YELLOW, Clr.RST))
 
-                    socks_host, socks_port = self.filter_hostname(user_args.socks)
-                    cert, resolved_ip, tls_version = self.get_cert(host, port, socks_host, socks_port)
+                    # Parse SOCKS address separately: default port 1080 if omitted
+                    if ':' in str(user_args.socks):
+                        socks_host, socks_port = str(user_args.socks).split(':', 1)
+                    else:
+                        socks_host, socks_port = str(user_args.socks), 1080
+                    cert, resolved_ip, tls_version = self.get_cert(host, port, socks_host, socks_port, timeout=getattr(user_args, 'timeout', 10), retries=getattr(user_args, 'retries', 1))
                 else:
-                    cert, resolved_ip, tls_version = self.get_cert(host, port)
+                    cert, resolved_ip, tls_version = self.get_cert(host, port, timeout=getattr(user_args, 'timeout', 10), retries=getattr(user_args, 'retries', 1))
 
                 context[host] = self.get_cert_info(host, cert, resolved_ip, tls_version)
                 context[host]['tcp_port'] = int(port)
@@ -349,17 +403,31 @@ class SSLChecker:
         if user_args.verbose:
             print('{}Generating CSV export{}\n'.format(Clr.YELLOW, Clr.RST))
 
+        # Filter only successful dict entries
+        records = [v for v in context.values() if isinstance(v, dict)]
+        if not records:
+            if user_args.verbose:
+                print('{}No successful records to export to CSV{}\n'.format(Clr.YELLOW, Clr.RST))
+            return
+
         with open(filename, 'w') as csv_file:
-            csv_writer = DictWriter(csv_file, list(context.items())[0][1].keys())
+            csv_writer = DictWriter(csv_file, records[0].keys())
             csv_writer.writeheader()
-            for host in context.keys():
-                csv_writer.writerow(context[host])
+            for rec in records:
+                csv_writer.writerow(rec)
 
     def export_html(self, context):
         """Export JSON to HTML."""
-        html = json2html.convert(json=context)
+        import importlib
+        try:
+            json2html_module = importlib.import_module('json2html')
+        except ImportError:
+            print('HTML export requires json2html. Please install it via: pip install json2html')
+            return
+
+        html = json2html_module.json2html.convert(json=context)
         file_name = datetime.strftime(datetime.now(), '%Y_%m_%d_%H_%M_%S')
-        with open('{}.html'.format(file_name), 'w') as html_file:
+        with open('{}.html'.format(file_name), 'w', encoding='utf-8') as html_file:
             html_file.write(html)
 
         return

@@ -1,15 +1,149 @@
-from fastapi import FastAPI, HTTPException, Query
-from typing import List
+import os
+import socket
+import ipaddress
+import time
+from collections import deque
+from typing import List, Optional, Tuple, Dict
+
+import logging
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, Response
+from contextlib import asynccontextmanager
 import json
 
 # Import the existing checker
 from ssl_checker import SSLChecker
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Basic startup diagnostics (does not log secrets)
+    logger.info(
+        "API starting. key_required=%s, rate_per_min=%s, max_hosts=%s, allowed_ports=%s",
+        bool(REQUIRE_API_KEY), RATE_LIMIT_PER_MIN, MAX_HOSTS, sorted(ALLOWED_PORTS),
+    )
+    yield
+
+
 app = FastAPI(
     title="SSL Checker API",
     version="1.0.0",
     description="Self-hosted API wrapper around the Python SSL/TLS checker",
+    lifespan=lifespan,
 )
+
+# Config (environment-overridable)
+MAX_HOSTS: int = int(os.getenv("SSL_CHECKER_MAX_HOSTS", "5"))
+_allowed_ports_env = os.getenv("SSL_CHECKER_ALLOWED_PORTS", "443")
+ALLOWED_PORTS = {int(p.strip()) for p in _allowed_ports_env.split(",") if p.strip().isdigit()}
+REQUIRE_API_KEY: Optional[str] = os.getenv("SSL_CHECKER_API_KEY")
+RATE_LIMIT_PER_MIN: int = int(os.getenv("SSL_CHECKER_RATE_PER_MIN", "60"))
+
+# naive in-memory rate limiter storage { ip: deque[timestamps] }
+_rl_buckets: Dict[str, deque] = {}
+
+
+def require_api_key(x_api_key: Optional[str] = Header(default=None)):
+    """Optional API key auth. If SSL_CHECKER_API_KEY is set, require matching X-API-Key header."""
+    if REQUIRE_API_KEY is None:
+        return
+    if not x_api_key or x_api_key != REQUIRE_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden: invalid API key")
+
+
+def rate_limit(request: Request):
+    """Very simple per-IP sliding-window rate limiter (requests/min)."""
+    if RATE_LIMIT_PER_MIN <= 0:
+        return
+    # Prefer X-Forwarded-For (first IP) when behind a proxy
+    xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+    client_ip = None
+    if xff:
+        client_ip = xff.split(",")[0].strip()
+    if not client_ip:
+        client = request.client
+        client_ip = client.host if client else "unknown"
+
+    now = time.time()
+    window_start = now - 60
+    bucket = _rl_buckets.setdefault(client_ip, deque())
+    # Drop old entries
+    while bucket and bucket[0] < window_start:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_PER_MIN:
+        raise HTTPException(status_code=429, detail="Too Many Requests")
+    bucket.append(now)
+
+
+logger = logging.getLogger("ssl-checker-api")
+
+
+@app.middleware("http")
+async def _enforce_security(request: Request, call_next):
+    # Enforce on API paths; allow healthz and docs without auth
+    path = request.url.path
+    if path.startswith("/api/") and not path.startswith("/api/docs"):
+        # Rate limit early
+        try:
+            rate_limit(request)
+        except HTTPException as e:
+            return Response(status_code=e.status_code, content=json.dumps({"detail": e.detail}), media_type="application/json")
+
+        if REQUIRE_API_KEY:
+            hdr = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+            if not hdr or hdr != REQUIRE_API_KEY:
+                return Response(status_code=403, content=json.dumps({"detail": "Forbidden: invalid API key"}), media_type="application/json")
+    return await call_next(request)
+
+
+def _parse_host_port(raw: str) -> Tuple[str, int]:
+    """Parse 'host[:port]' and validate basic format."""
+    if "://" in raw or "/" in raw or "[" in raw or "]" in raw:
+        raise HTTPException(status_code=400, detail=f"Invalid host format: {raw}")
+    host = raw
+    port = 443
+    if ":" in raw:
+        parts = raw.rsplit(":", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1].isdigit():
+            raise HTTPException(status_code=400, detail=f"Invalid host:port: {raw}")
+        host, port_str = parts
+        port = int(port_str)
+    if port not in ALLOWED_PORTS:
+        raise HTTPException(status_code=400, detail=f"Port not allowed: {port}")
+    return host, port
+
+
+def _is_disallowed_ip(ip: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        return (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        )
+    except ValueError:
+        return True
+
+
+def _validate_no_ssrf(host: str, allow_unresolved: bool = True):
+    """Resolve host and block connections to private/link-local/loopback/etc.
+
+    If allow_unresolved is True, do not raise when DNS resolution fails (let the checker handle it).
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        if allow_unresolved:
+            return
+        raise HTTPException(status_code=400, detail=f"Failed to resolve host '{host}': {e}")
+    ips = {str(info[4][0]) for info in infos if info and info[4]}
+    if not ips:
+        raise HTTPException(status_code=400, detail=f"No IPs resolved for host '{host}'")
+    # If any resolved IP is disallowed, reject to prevent SSRF
+    for ip in ips:
+        if _is_disallowed_ip(ip):
+            raise HTTPException(status_code=400, detail=f"Host '{host}' resolves to a disallowed IP: {ip}")
 
 
 @app.get("/healthz")
@@ -35,10 +169,12 @@ def _run_check(hosts: List[str], analyze: bool = False) -> dict:
 
 
 @app.get("/api/v1/check/{host}")
-def check_single_host(host: str, analyze: bool = False):
+def check_single_host(host: str, analyze: bool = False, auth: None = Depends(require_api_key), _rl: None = Depends(rate_limit)):
     """
     Check a single host. Host may include an optional port (e.g., example.com:8443).
     """
+    normalized_host, _port = _parse_host_port(host)
+    _validate_no_ssrf(normalized_host)
     data = _run_check([host], analyze=analyze)
     # If the checker marked it failed, reflect a 502 error. The checker normalizes the host key
     # (e.g., strips ports), so detect any single-entry failure regardless of key name.
@@ -55,6 +191,8 @@ def check_single_host(host: str, analyze: bool = False):
 def check_multiple_hosts(
     hosts: List[str] = Query(..., description="One or more hosts, can repeat the param: ?hosts=a.com&hosts=b.com"),
     analyze: bool = False,
+    auth: None = Depends(require_api_key),
+    _rl: None = Depends(rate_limit),
 ):
     """
     Check multiple hosts using repeated query params, e.g.:
@@ -62,5 +200,12 @@ def check_multiple_hosts(
     """
     if not hosts:
         raise HTTPException(status_code=400, detail="At least one host is required")
+    if len(hosts) > MAX_HOSTS:
+        raise HTTPException(status_code=400, detail=f"Too many hosts; max {MAX_HOSTS}")
+
+    # Validate each host before running
+    for raw in hosts:
+        h, _port = _parse_host_port(raw)
+        _validate_no_ssrf(h)
     data = _run_check(hosts, analyze=analyze)
     return data
