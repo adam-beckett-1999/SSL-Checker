@@ -92,11 +92,16 @@ def _is_disallowed_ip(ip: str) -> bool:
         return True
 
 
-def _validate_no_ssrf(host: str):
-    """Resolve host and block connections to private/link-local/loopback/etc."""
+def _validate_no_ssrf(host: str, allow_unresolved: bool = True):
+    """Resolve host and block connections to private/link-local/loopback/etc.
+
+    If allow_unresolved is True, do not raise when DNS resolution fails (let the checker handle it).
+    """
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception as e:
+        if allow_unresolved:
+            return
         raise HTTPException(status_code=400, detail=f"Failed to resolve host '{host}': {e}")
     ips = {str(info[4][0]) for info in infos if info and info[4]}
     if not ips:
