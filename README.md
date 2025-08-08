@@ -77,7 +77,7 @@ You can tune basic safety limits using environment variables (all have sensible 
 - SSL_CHECKER_MAX_HOSTS (default 5): Max number of hosts per request.
 - SSL_CHECKER_ALLOWED_PORTS (default 443): Comma‑separated list of allowed ports, e.g. `443,8443`.
 - SSL_CHECKER_RATE_PER_MIN (default 60): Per‑IP requests per minute.
-- SSL_CHECKER_API_KEY (empty by default): If set, requests must include header `X-API-Key` with this value.
+- SSL_CHECKER_API_KEY (set at runtime only): If set, requests must include header `X-API-Key` with this value.
 
 Example:
 
@@ -89,6 +89,8 @@ docker run --rm -p 8000:8000 \
   -e SSL_CHECKER_API_KEY=changeme \
   sentinelkasai/ssl-checker:dev
 ```
+
+Tip: The image includes a HEALTHCHECK that calls `/healthz`. In CI, consider waiting for `docker inspect -f '{{json .State.Health.Status}}'` to be `healthy` before curl tests.
 
 ## Use the CLI (inside Docker)
 
