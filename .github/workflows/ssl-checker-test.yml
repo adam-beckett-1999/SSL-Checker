@@ -101,9 +101,25 @@ jobs:
     - name: Run Docker container and test endpoints
       run: |
         docker run -d -p 18000:8000 --name sslc_api_test ssl-checker-api
+        # Wait for readiness
         for i in {1..30}; do curl -fsS http://127.0.0.1:18000/healthz && break; sleep 1; done
         curl -s http://127.0.0.1:18000/api/v1/check/example.com | grep -q 'example.com'
         curl -s "http://127.0.0.1:18000/api/v1/check?hosts=example.com&hosts=github.com:443" | grep -q 'github.com'
         code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18000/api/v1/check/notarealhost.invalid)
         echo "$code" && test "$code" = "502"
         docker rm -f sslc_api_test
+
+    - name: Run Docker container with API key and test auth/SSRF
+      run: |
+        docker run -d -p 18001:8000 -e SSL_CHECKER_API_KEY=ci-key --name sslc_api_sec ssl-checker-api
+        for i in {1..30}; do curl -fsS http://127.0.0.1:18001/healthz && break; sleep 1; done
+        # Expect 403 without key
+        code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18001/api/v1/check/example.com)
+        echo "$code" && test "$code" = "403"
+        # Works with key
+        code=$(curl -s -H 'X-API-Key: ci-key' -o /dev/null -w "%{http_code}" http://127.0.0.1:18001/api/v1/check/example.com)
+        echo "$code" && test "$code" = "200"
+        # SSRF guard should reject loopback
+        code=$(curl -s -H 'X-API-Key: ci-key' -o /dev/null -w "%{http_code}" http://127.0.0.1:18001/api/v1/check/127.0.0.1)
+        echo "$code" && test "$code" = "400"
+        docker rm -f sslc_api_sec

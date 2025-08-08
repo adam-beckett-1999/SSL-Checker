@@ -18,8 +18,8 @@ EXPOSE 8000
 
 # Security/configuration defaults (override at runtime with -e)
 ENV SSL_CHECKER_MAX_HOSTS=5 \
-        SSL_CHECKER_ALLOWED_PORTS=443 \
-        SSL_CHECKER_RATE_PER_MIN=60
+    SSL_CHECKER_ALLOWED_PORTS=443 \
+    SSL_CHECKER_RATE_PER_MIN=60
 
 # Container health check (uses busybox wget available in Alpine)
 HEALTHCHECK --interval=5s --timeout=3s --start-period=3s --retries=10 \
