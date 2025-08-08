@@ -41,23 +41,15 @@ class SSLChecker:
             use_socks = True
 
         # Prefer a generic TLS client method (negotiates the highest version, including TLS 1.3),
-        # with fallbacks to specific methods for older OpenSSL/servers.
+        # with a single legacy alias fallback for older OpenSSL.
         method_candidates = []
         if hasattr(SSL, 'TLS_CLIENT_METHOD'):
-            method_candidates.append(('auto', getattr(SSL, 'TLS_CLIENT_METHOD')))
+            method_candidates.append(('auto', SSL.TLS_CLIENT_METHOD))
         elif hasattr(SSL, 'TLS_METHOD'):
-            method_candidates.append(('auto', getattr(SSL, 'TLS_METHOD')))
+            method_candidates.append(('auto', SSL.TLS_METHOD))
         elif hasattr(SSL, 'SSLv23_METHOD'):
-            # Historical name that negotiates the highest available protocol
-            method_candidates.append(('auto', getattr(SSL, 'SSLv23_METHOD')))
-
-        # Keep legacy explicit fallbacks (lowest chance to be needed)
-        if hasattr(SSL, 'TLSv1_2_METHOD'):
-            method_candidates.append(('TLS 1.2', getattr(SSL, 'TLSv1_2_METHOD')))
-        if hasattr(SSL, 'TLSv1_1_METHOD'):
-            method_candidates.append(('TLS 1.1', getattr(SSL, 'TLSv1_1_METHOD')))
-        if hasattr(SSL, 'TLSv1_METHOD'):
-            method_candidates.append(('TLS 1.0', getattr(SSL, 'TLSv1_METHOD')))
+            # Historical alias that negotiates the highest available protocol
+            method_candidates.append(('auto', SSL.SSLv23_METHOD))
 
         last_error = None
         for label, tls_method in method_candidates:
@@ -116,44 +108,65 @@ class SSLChecker:
         print(result)
 
     def analyze_ssl(self, host, context, user_args):
-        """Analyze the security of the SSL certificate."""
+        """Analyze the security of the SSL certificate using SSL Labs.
+
+        Fast-path behavior: prefer cached results and avoid long waits/timeouts in CI.
+        If cached results are not READY, annotate and return without blocking.
+        """
         from urllib.request import urlopen
+        from urllib.error import URLError, HTTPError
 
         api_url = 'https://api.ssllabs.com/api/v3/'
-        while True:
-            if user_args.verbose:
-                print('{}Requesting analyze to {}{}\n'.format(Clr.YELLOW, api_url, Clr.RST))
-
-            main_request = json.loads(urlopen(api_url + 'analyze?host={}'.format(host)).read().decode('utf-8'))
-            if main_request['status'] in ('DNS', 'IN_PROGRESS'):
-                if user_args.verbose:
-                    print('{}Analyze waiting for reports to be finished (5 secs){}\n'.format(Clr.YELLOW, Clr.RST))
-
-                sleep(5)
-                continue
-            elif main_request['status'] == 'READY':
-                if user_args.verbose:
-                    print('{}Analyze is ready{}\n'.format(Clr.YELLOW, Clr.RST))
-
-                break
-
-        endpoint_data = json.loads(urlopen(api_url + 'getEndpointData?host={}&s={}'.format(
-            host, main_request['endpoints'][0]['ipAddress'])).read().decode('utf-8'))
+        analyze_url = f"{api_url}analyze?host={host}&fromCache=on&all=done&startNew=off"
 
         if user_args.verbose:
-            print('{}Analyze report message: {}{}\n'.format(Clr.YELLOW, endpoint_data['statusMessage'], Clr.RST))
+            print('{}Requesting analyze (cached) from {}{}\n'.format(Clr.YELLOW, api_url, Clr.RST))
 
-        # if the certificate is invalid
-        if endpoint_data['statusMessage'] == 'Certificate not valid for domain name':
+        try:
+            main_request = json.loads(urlopen(analyze_url, timeout=10).read().decode('utf-8'))
+        except (URLError, HTTPError, TimeoutError) as e:
+            # Do not fail the overall run; annotate and return
+            context.setdefault(host, {})
+            context[host]['analyze_error'] = f'SSL Labs request failed: {e}'
             return context
 
-        context[host]['grade'] = main_request['endpoints'][0]['grade']
-        context[host]['poodle_vuln'] = endpoint_data['details']['poodle']
-        context[host]['heartbleed_vuln'] = endpoint_data['details']['heartbleed']
-        context[host]['heartbeat_vuln'] = endpoint_data['details']['heartbeat']
-        context[host]['freak_vuln'] = endpoint_data['details']['freak']
-        context[host]['logjam_vuln'] = endpoint_data['details']['logjam']
-        context[host]['drownVulnerable'] = endpoint_data['details']['drownVulnerable']
+        status = main_request.get('status')
+        if status != 'READY':
+            # Avoid long waits; annotate status and return
+            context.setdefault(host, {})
+            context[host]['analyze_status'] = status or 'UNKNOWN'
+            return context
+
+        # With READY status, proceed to fetch endpoint details
+        try:
+            ip_addr = main_request['endpoints'][0]['ipAddress']
+            endpoint_url = f"{api_url}getEndpointData?host={host}&s={ip_addr}"
+            endpoint_data = json.loads(urlopen(endpoint_url, timeout=10).read().decode('utf-8'))
+        except Exception as e:
+            context.setdefault(host, {})
+            context[host]['analyze_error'] = f'Endpoint fetch failed: {e}'
+            return context
+
+        if user_args.verbose:
+            print('{}Analyze report message: {}{}\n'.format(Clr.YELLOW, endpoint_data.get('statusMessage', 'n/a'), Clr.RST))
+
+        # if the certificate is invalid
+        if endpoint_data.get('statusMessage') == 'Certificate not valid for domain name':
+            return context
+
+        # Populate known fields when present
+        try:
+            context[host]['grade'] = main_request['endpoints'][0].get('grade')
+            details = endpoint_data.get('details', {})
+            context[host]['poodle_vuln'] = details.get('poodle')
+            context[host]['heartbleed_vuln'] = details.get('heartbleed')
+            context[host]['heartbeat_vuln'] = details.get('heartbeat')
+            context[host]['freak_vuln'] = details.get('freak')
+            context[host]['logjam_vuln'] = details.get('logjam')
+            context[host]['drownVulnerable'] = details.get('drownVulnerable')
+        except Exception:
+            # Keep resilient even if schema shifts
+            pass
 
         return context
 
