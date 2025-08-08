@@ -1,17 +1,20 @@
-FROM python:3.8-alpine AS builder
+FROM python:3.11-alpine
+
+# Ensure all packages are up to date to reduce vulnerabilities
+RUN apk update && apk upgrade
 
 WORKDIR /app
-COPY requirements.txt .
 
-RUN apk add --no-cache gcc musl-dev libffi-dev \
-    && pip install --no-cache-dir -r requirements.txt \
+# System deps for cryptography/pyopenssl
+RUN apk add --no-cache gcc musl-dev libffi-dev openssl-dev
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
     && apk del gcc musl-dev libffi-dev
 
-FROM python:3.8-alpine
+COPY . /app
 
-COPY --from=builder /usr/local/lib/python3.8/site-packages /usr/local/lib/python3.8/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+EXPOSE 8000
 
-COPY . .
-
-ENTRYPOINT ["python", "/ssl_checker.py"]
+# Default to run the API server; can override to run the CLI
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

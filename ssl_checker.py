@@ -3,7 +3,7 @@ import socket
 import sys
 import json
 
-from argparse import ArgumentParser, SUPPRESS
+from argparse import ArgumentParser, SUPPRESS, Namespace
 from datetime import datetime
 from time import sleep
 from csv import DictWriter
@@ -33,44 +33,73 @@ class SSLChecker:
     total_warning = 0
 
     def get_cert(self, host, port, socks_host=None, socks_port=None):
-        """Connection to the host."""
+        """Connect to the host and negotiate TLS, preferring the highest version (TLS 1.3 if available)."""
         if socks_host:
             import socks
-
-            socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, socks_host, int(socks_port), True)
+            socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, socks_host, int(socks_port), True) # pyright: ignore[reportArgumentType]
             socket.socket = socks.socksocket
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        sock.connect((host, int(port)))
-        sock.settimeout(None)
-        
-        # Try different TLS versions in order of preference (newest to oldest)
-        tls_methods = [
-            (SSL.TLSv1_2_METHOD, "TLS 1.2"),  # TLS 1.2
-            (SSL.TLSv1_1_METHOD, "TLS 1.1"),  # TLS 1.1
-            (SSL.TLSv1_METHOD, "TLS 1.0"),    # TLS 1.0
-        ]
-        
-        for tls_method, tls_version in tls_methods:
+        # Prefer a generic TLS client method (negotiates the highest version, including TLS 1.3),
+        # with fallbacks to specific methods for older OpenSSL/servers.
+        method_candidates = []
+        if hasattr(SSL, 'TLS_CLIENT_METHOD'):
+            method_candidates.append(('auto', getattr(SSL, 'TLS_CLIENT_METHOD')))
+        elif hasattr(SSL, 'TLS_METHOD'):
+            method_candidates.append(('auto', getattr(SSL, 'TLS_METHOD')))
+        elif hasattr(SSL, 'SSLv23_METHOD'):
+            # Historical name that negotiates the highest available protocol
+            method_candidates.append(('auto', getattr(SSL, 'SSLv23_METHOD')))
+
+        # Keep legacy explicit fallbacks (lowest chance to be needed)
+        if hasattr(SSL, 'TLSv1_2_METHOD'):
+            method_candidates.append(('TLS 1.2', getattr(SSL, 'TLSv1_2_METHOD')))
+        if hasattr(SSL, 'TLSv1_1_METHOD'):
+            method_candidates.append(('TLS 1.1', getattr(SSL, 'TLSv1_1_METHOD')))
+        if hasattr(SSL, 'TLSv1_METHOD'):
+            method_candidates.append(('TLS 1.0', getattr(SSL, 'TLSv1_METHOD')))
+
+        last_error = None
+        for label, tls_method in method_candidates:
+            sock = None
             try:
-                osobj = SSL.Context(tls_method)
-                oscon = SSL.Connection(osobj, sock)
-                oscon.set_tlsext_host_name(host.encode())
-                oscon.set_connect_state()
-                oscon.do_handshake()
-                cert = oscon.get_peer_certificate()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect((host, int(port)))
+                sock.settimeout(None)
+
+                ctx = SSL.Context(tls_method)
+                con = SSL.Connection(ctx, sock)
+                con.set_tlsext_host_name(host.encode())
+                con.set_connect_state()
+                con.do_handshake()
+
+                cert = con.get_peer_certificate()
                 resolved_ip = socket.gethostbyname(host)
-                sock.close()
+
+                # Determine the negotiated protocol version if available
+                tls_version = label
+                if hasattr(con, 'get_protocol_version_name'):
+                    try:
+                        negotiated = con.get_protocol_version_name()
+                        # Normalize OpenSSL name to our display format
+                        if negotiated and isinstance(negotiated, str):
+                            tls_version = negotiated.replace('TLSv', 'TLS ')
+                    except Exception:
+                        pass
                 return cert, resolved_ip, tls_version
-            except SSL.SysCallError as e:
-                # If this TLS version fails, try the next one
-                continue
             except Exception as e:
-                # For other exceptions, try the next TLS version
+                last_error = e
                 continue
-        
-        # If all TLS versions fail, raise the last exception
+            finally:
+                try:
+                    if sock:
+                        sock.close()
+                except Exception:
+                    pass
+
+        # If all attempts fail, raise the last captured error
+        if last_error:
+            raise last_error
         raise SSL.SysCallError("Failed to establish SSL connection with any supported TLS version")
 
     def border_msg(self, message):
@@ -350,7 +379,8 @@ class SSLChecker:
                                 description="""Collects useful information about the given host's SSL certificates.""")
 
         if len(json_args) > 0:
-            args = parser.parse_args()
+            # When used as a module, don't parse sys.argv; construct a Namespace
+            args = Namespace()
             setattr(args, 'json_true', True)
             setattr(args, 'verbose', False)
             setattr(args, 'csv_enabled', False)
@@ -358,6 +388,7 @@ class SSLChecker:
             setattr(args, 'json_save_true', False)
             setattr(args, 'socks', False)
             setattr(args, 'analyze', False)
+            setattr(args, 'summary_true', False)
             setattr(args, 'hosts', json_args['hosts'])
             return args
 
