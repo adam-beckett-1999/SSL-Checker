@@ -58,7 +58,9 @@ Base URL: `/`
   - Path parameter `host`: domain, optionally with port (e.g., `example.com:8443`)
   - Query parameter `analyze` (bool, default false): include SSL Labs report when true
   - Response: JSON object keyed by normalized host
-  - On connection/handshake failure for the host, returns HTTP 502
+  - Behavior on failures:
+    - If the hostname cannot be resolved (DNS failure), returns HTTP 502.
+    - If TLS connection/handshake fails for a resolvable host, returns HTTP 200 with the host value set to `"failed"`.
 
 - GET `/api/v1/check`
   - Query parameter `hosts`: repeatable, e.g., `?hosts=a.com&hosts=b.com:443`
