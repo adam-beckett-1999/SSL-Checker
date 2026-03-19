@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   ssl-checker:
     # Use the published image, or switch to `build: .` for local dev builds
